@@ -1,18 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
 import "./StudentAttendanceDashboard.css";
-
-/* ------------------------------------------------------------------ */
-/*  Mock data                                                          */
-/*  Replace these with your Django REST responses later. The           */
-/*  component accepts every one of them as a prop (see bottom of the   */
-/*  component signature), so you can fetch in a parent and pass down.  */
-/* ------------------------------------------------------------------ */
 
 const MIN_ATTENDANCE = 75; // college minimum
 const GOOD_FROM = 85; // at or above this = "Good"
 
-// Django REST API
-// Change this only if your Django server runs on another host/port.
 const API_BASE_URL = "http://127.0.0.1:8000";
 const MAX_ATTENDANCE_PERIOD = 5;
 
@@ -22,7 +14,7 @@ const STUDENT = {
   program: "MCA",
   department: "Computer Applications",
   semester: "Semester 3",
-  photo: null, // put an image URL here to replace the initials avatar
+  photo: null,
 };
 
 const SUBJECTS = [
@@ -88,10 +80,6 @@ const NAV = [
   { id: "profile", label: "Profile", icon: "user", target: "student-profile" },
 ];
 
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
 const reducedMotion = () =>
   typeof window !== "undefined" &&
   typeof window.matchMedia === "function" &&
@@ -108,7 +96,6 @@ function toneOf(pct) {
 const TONE_LABEL = { good: "Good", warning: "Warning", critical: "Critical" };
 const TONE_LONG = { good: "Good attendance", warning: "Attendance warning", critical: "Critical attendance" };
 
-/** How many classes can be missed (or must be attended) to stay at the minimum. */
 function marginInfo(present, total) {
   const need = MIN_ATTENDANCE / 100;
   if (present / total >= need) {
@@ -158,11 +145,6 @@ const initialsOf = (name) =>
     .slice(0, 2)
     .toUpperCase();
 
-/* ------------------------------------------------------------------ */
-/*  Hooks                                                              */
-/* ------------------------------------------------------------------ */
-
-/** Flips to true shortly after mount so CSS transitions have a start state. */
 function useReady(delay = 80) {
   const [ready, setReady] = useState(false);
   useEffect(() => {
@@ -209,10 +191,6 @@ function useNow(intervalMs = 30000) {
   }, [intervalMs]);
   return now;
 }
-
-/* ------------------------------------------------------------------ */
-/*  Small pieces                                                       */
-/* ------------------------------------------------------------------ */
 
 const ICONS = {
   dashboard: (
@@ -552,11 +530,38 @@ function CameraAttendanceCard({
   onAttendanceMarked,
   recentlyMarkedStudentId,
 }) {
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
+  const entryVideoRef = useRef(null);
+  const exitVideoRef = useRef(null);
+  const entryStreamRef = useRef(null);
+  const exitStreamRef = useRef(null);
   const canvasRef = useRef(null);
-  const [cameraState, setCameraState] = useState("idle");
+
+  // Browser-side face detection is only used to decide WHEN to capture.
+  // Django remains responsible for identity recognition and attendance.
+  // Each camera has its own MediaPipe detector. Sharing one VIDEO-mode
+  // detector between two independent video streams can cause timestamp/state
+  // conflicts and stop the second detection loop after the first capture.
+  const entryFaceDetectorRef = useRef(null);
+  const exitFaceDetectorRef = useRef(null);
+  const captureFrameRef = useRef(null);
+  const detectionFrameRef = useRef({ entry: null, exit: null });
+  const detectionTimingRef = useRef({ entry: 0, exit: 0 });
+  const consecutiveFacesRef = useRef({ entry: 0, exit: 0 });
+  const processingRef = useRef({ entry: false, exit: false });
+  const lastCaptureTimeRef = useRef({ entry: 0, exit: 0 });
+
+  const FACE_DETECTION_INTERVAL_MS = 150;
+  const FACE_CONFIRMATION_FRAMES = 2;
+  const CAPTURE_COOLDOWN_MS = 5000;
+
+  const [faceDetectorReady, setFaceDetectorReady] = useState(false);
+  const [entryCameraState, setEntryCameraState] = useState("idle");
+  const [exitCameraState, setExitCameraState] = useState("idle");
   const [cameraError, setCameraError] = useState("");
+  const [cameraDevices, setCameraDevices] = useState([]);
+  const [entryDeviceId, setEntryDeviceId] = useState("");
+  const [exitDeviceId, setExitDeviceId] = useState("");
+  const [changingCamera, setChangingCamera] = useState(null);
   const [captureMessage, setCaptureMessage] = useState("");
   const [verificationState, setVerificationState] = useState("idle");
   const [matchedStudent, setMatchedStudent] = useState(null);
@@ -572,52 +577,7 @@ function CameraAttendanceCard({
   const absentCount = students.filter((student) => student.status === "A").length;
   const pendingCount = students.filter((student) => student.status === "-").length;
 
-  const startCamera = async () => {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraState("error");
-      setCameraError("Camera access is not supported by this browser.");
-      return;
-    }
-
-    try {
-      setCameraError("");
-      setCaptureMessage("");
-      setCameraState("requesting");
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-        audio: false,
-      });
-
-      streamRef.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => {});
-      }
-
-      setCameraState("active");
-    } catch (error) {
-      console.error("Camera access error:", error);
-      setCameraState("error");
-
-      if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
-        setCameraError("Camera permission was denied. Allow camera access in your browser and try again.");
-      } else if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
-        setCameraError("No camera was found on this device.");
-      } else if (error.name === "NotReadableError" || error.name === "TrackStartError") {
-        setCameraError("The camera is already being used by another application.");
-      } else {
-        setCameraError("Unable to access the camera. Please check your camera and browser permissions.");
-      }
-    }
-  };
-
-  const stopCamera = () => {
+  const stopStream = (streamRef, videoRef) => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -626,27 +586,278 @@ function CameraAttendanceCard({
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+  };
 
-    setCameraState("idle");
+  const startTwoCameras = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setEntryCameraState("error");
+      setExitCameraState("error");
+      setCameraError("Camera access is not supported by this browser.");
+      return;
+    }
+
+    try {
+      setCameraError("");
+      setCaptureMessage("");
+      setEntryCameraState("requesting");
+      setExitCameraState("requesting");
+
+      // Ask for permission first. This also makes camera labels available
+      // on browsers that hide them before permission is granted.
+      const permissionStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false,
+      });
+      permissionStream.getTracks().forEach((track) => track.stop());
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter((device) => device.kind === "videoinput");
+
+      setCameraDevices(cameras);
+      console.log("Available browser cameras:", cameras);
+
+      if (cameras.length < 2) {
+        setEntryCameraState(cameras.length === 1 ? "active" : "error");
+        setExitCameraState("error");
+        setCameraError(
+          cameras.length === 1
+            ? "Only one camera was detected. Connect your second webcam and reload the page."
+            : "No cameras were detected."
+        );
+
+        // If exactly one camera exists, keep it available as the entry camera.
+        if (cameras.length === 1) {
+          const entryStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              deviceId: { exact: cameras[0].deviceId },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+            audio: false,
+          });
+
+          entryStreamRef.current = entryStream;
+          setEntryDeviceId(cameras[0].deviceId);
+          if (entryVideoRef.current) {
+            entryVideoRef.current.srcObject = entryStream;
+            await entryVideoRef.current.play().catch(() => {});
+          }
+        }
+        return;
+      }
+
+      // Browser camera ordering is not guaranteed to match OpenCV indices.
+      // For this prototype we use the first two detected video devices.
+      const entryStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: cameras[0].deviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+
+      const exitStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: cameras[1].deviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+
+      entryStreamRef.current = entryStream;
+      exitStreamRef.current = exitStream;
+      setEntryDeviceId(cameras[0].deviceId);
+      setExitDeviceId(cameras[1].deviceId);
+
+      if (entryVideoRef.current) {
+        entryVideoRef.current.srcObject = entryStream;
+        await entryVideoRef.current.play().catch(() => {});
+      }
+
+      if (exitVideoRef.current) {
+        exitVideoRef.current.srcObject = exitStream;
+        await exitVideoRef.current.play().catch(() => {});
+      }
+
+      setEntryCameraState("active");
+      setExitCameraState("active");
+    } catch (error) {
+      console.error("Two-camera access error:", error);
+
+      stopStream(entryStreamRef, entryVideoRef);
+      stopStream(exitStreamRef, exitVideoRef);
+
+      setEntryCameraState("error");
+      setExitCameraState("error");
+
+      if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
+        setCameraError("Camera permission was denied. Allow camera access in your browser and try again.");
+      } else if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
+        setCameraError("One or both cameras could not be found.");
+      } else if (error.name === "NotReadableError" || error.name === "TrackStartError") {
+        setCameraError("One or both cameras are already being used by another application.");
+      } else {
+        setCameraError("Unable to access both cameras. Check the webcams and browser permissions.");
+      }
+    }
+  };
+
+  const changeCamera = async (cameraRole) => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError("Camera access is not supported by this browser.");
+      return;
+    }
+
+    if (changingCamera) return;
+
+    try {
+      setChangingCamera(cameraRole);
+      setCameraError("");
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter((device) => device.kind === "videoinput");
+      setCameraDevices(cameras);
+
+      if (cameras.length < 2) {
+        setCameraError(
+          "Only one camera is available. Connect another webcam to change cameras."
+        );
+        return;
+      }
+
+      const currentDeviceId =
+        cameraRole === "entry" ? entryDeviceId : exitDeviceId;
+      const otherDeviceId =
+        cameraRole === "entry" ? exitDeviceId : entryDeviceId;
+
+      const currentIndex = cameras.findIndex(
+        (device) => device.deviceId === currentDeviceId
+      );
+
+      let nextDevice = null;
+
+      for (let step = 1; step <= cameras.length; step += 1) {
+        const candidate =
+          cameras[(currentIndex + step + cameras.length) % cameras.length];
+
+        if (candidate.deviceId !== otherDeviceId) {
+          nextDevice = candidate;
+          break;
+        }
+      }
+
+      if (!nextDevice) {
+        setCameraError("No different camera is available.");
+        return;
+      }
+
+      const isEntry = cameraRole === "entry";
+      const streamRef = isEntry ? entryStreamRef : exitStreamRef;
+      const videoRef = isEntry ? entryVideoRef : exitVideoRef;
+      const setState = isEntry ? setEntryCameraState : setExitCameraState;
+      const setDeviceId = isEntry ? setEntryDeviceId : setExitDeviceId;
+
+      stopStream(streamRef, videoRef);
+      setState("requesting");
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: nextDevice.deviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+
+      streamRef.current = stream;
+      setDeviceId(nextDevice.deviceId);
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {});
+      }
+
+      setState("active");
+      setCaptureMessage(
+        `${isEntry ? "Entry" : "Exit"} camera changed to ${
+          nextDevice.label || "another camera"
+        }.`
+      );
+      setVerificationState("idle");
+      setMatchedStudent(null);
+    } catch (error) {
+      console.error(`Change ${cameraRole} camera error:`, error);
+
+      const isEntry = cameraRole === "entry";
+      const setState = isEntry ? setEntryCameraState : setExitCameraState;
+      setState("error");
+
+      if (
+        error.name === "NotAllowedError" ||
+        error.name === "PermissionDeniedError"
+      ) {
+        setCameraError(
+          "Camera permission was denied. Allow camera access and try again."
+        );
+      } else if (
+        error.name === "NotFoundError" ||
+        error.name === "DevicesNotFoundError"
+      ) {
+        setCameraError("The selected camera could not be found.");
+      } else if (
+        error.name === "NotReadableError" ||
+        error.name === "TrackStartError"
+      ) {
+        setCameraError(
+          "That camera is already being used by another application."
+        );
+      } else {
+        setCameraError("Unable to switch to the selected camera.");
+      }
+    } finally {
+      setChangingCamera(null);
+    }
+  };
+
+  const stopAllCameras = () => {
+    if (detectionFrameRef.current.entry !== null) {
+      cancelAnimationFrame(detectionFrameRef.current.entry);
+      detectionFrameRef.current.entry = null;
+    }
+    if (detectionFrameRef.current.exit !== null) {
+      cancelAnimationFrame(detectionFrameRef.current.exit);
+      detectionFrameRef.current.exit = null;
+    }
+
+    consecutiveFacesRef.current = { entry: 0, exit: 0 };
+    processingRef.current = { entry: false, exit: false };
+
+    stopStream(entryStreamRef, entryVideoRef);
+    stopStream(exitStreamRef, exitVideoRef);
+    setEntryCameraState("idle");
+    setExitCameraState("idle");
+    setEntryDeviceId("");
+    setExitDeviceId("");
     setCaptureMessage("");
     setVerificationState("idle");
     setMatchedStudent(null);
   };
 
-  const captureFrame = async () => {
-    if (!videoRef.current || cameraState !== "active") return;
-    if (verificationState === "checking") return;
+  const captureFrame = async (cameraRole = "entry") => {
+    const video = cameraRole === "entry" ? entryVideoRef.current : exitVideoRef.current;
+    const cameraState = cameraRole === "entry" ? entryCameraState : exitCameraState;
 
-    const video = videoRef.current;
+    if (!video || cameraState !== "active") return;
+
     const canvas = canvasRef.current || document.createElement("canvas");
-
     canvas.width = video.videoWidth || 1280;
     canvas.height = video.videoHeight || 720;
 
     const context = canvas.getContext("2d");
     if (!context) return;
 
-    // Capture the same mirrored image shown in the live camera preview.
     context.save();
     context.translate(canvas.width, 0);
     context.scale(-1, 1);
@@ -657,7 +868,9 @@ function CameraAttendanceCard({
 
     setMatchedStudent(null);
     setVerificationState("checking");
-    setCaptureMessage("Face captured — checking with the student photos...");
+    setCaptureMessage(
+      `${cameraRole === "entry" ? "Entry" : "Exit"} camera captured — checking with the student photos...`
+    );
 
     try {
       const blob = await new Promise((resolve, reject) => {
@@ -674,9 +887,10 @@ function CameraAttendanceCard({
       const todayIso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 
       const formData = new FormData();
-      formData.append("image", blob, "live_capture.jpg");
+      formData.append("image", blob, `${cameraRole}_live_capture.jpg`);
       formData.append("timing", todayIso);
       formData.append("period", String(selectedPeriod));
+      formData.append("camera_role", cameraRole);
 
       const response = await fetch(
         `${API_BASE_URL}/student/verify-student-face/`,
@@ -706,8 +920,6 @@ function CameraAttendanceCard({
           `Face matched — ${data.student.student_name} (${data.student.register_no}). Attendance marked Present for Period ${selectedPeriod}.`
         );
 
-        // Immediately update the visible table from the successful backend response.
-        // This changes only the matched student's row from '-' to 'P'.
         if (data.attendance && onAttendanceMarked) {
           onAttendanceMarked({
             student: data.student,
@@ -717,9 +929,7 @@ function CameraAttendanceCard({
       } else {
         setMatchedStudent(null);
         setVerificationState("not-matched");
-        setCaptureMessage(
-          data.message || "No matching student found."
-        );
+        setCaptureMessage(data.message || "No matching student found.");
       }
     } catch (error) {
       console.error("Face verification error:", error);
@@ -731,17 +941,296 @@ function CameraAttendanceCard({
     }
   };
 
+  // Load one lightweight MediaPipe detector per camera. The detector only answers
+  // "is there a face?". Django still performs the actual identity recognition.
+  // Keeping separate VIDEO-mode detectors prevents the two camera streams from
+  // interfering with each other's timestamps/state.
   useEffect(() => {
-    startCamera();
+    let cancelled = false;
 
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
+    const loadFaceDetectors = async () => {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+
+        const detectorOptions = {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+          },
+          runningMode: "VIDEO",
+          minDetectionConfidence: 0.60,
+        };
+
+        const [entryDetector, exitDetector] = await Promise.all([
+          FaceDetector.createFromOptions(vision, detectorOptions),
+          FaceDetector.createFromOptions(vision, detectorOptions),
+        ]);
+
+        if (cancelled) {
+          entryDetector.close();
+          exitDetector.close();
+          return;
+        }
+
+        entryFaceDetectorRef.current = entryDetector;
+        exitFaceDetectorRef.current = exitDetector;
+        setFaceDetectorReady(true);
+      } catch (error) {
+        console.error("Face detector initialization error:", error);
+
+        if (!cancelled) {
+          setFaceDetectorReady(false);
+          setCameraError(
+            "Unable to load automatic face detection. Check your internet connection and reload the page."
+          );
+        }
       }
     };
-    // Camera is intentionally requested once when this section mounts.
+
+    loadFaceDetectors();
+
+    return () => {
+      cancelled = true;
+      setFaceDetectorReady(false);
+
+      if (entryFaceDetectorRef.current) {
+        entryFaceDetectorRef.current.close();
+        entryFaceDetectorRef.current = null;
+      }
+
+      if (exitFaceDetectorRef.current) {
+        exitFaceDetectorRef.current.close();
+        exitFaceDetectorRef.current = null;
+      }
+    };
+  }, []);
+
+  // Keep the latest capture function available to the detection loop without
+  // restarting requestAnimationFrame every time React state changes.
+  captureFrameRef.current = captureFrame;
+
+  // Watch each camera continuously. A face must be detected in two consecutive
+  // checks before capture. After a capture, that camera waits five seconds
+  // before allowing another automatic capture.
+  useEffect(() => {
+    if (!faceDetectorReady) return undefined;
+
+    const startDetection = (cameraRole) => {
+      const isEntry = cameraRole === "entry";
+      const getVideo = () => (isEntry ? entryVideoRef.current : exitVideoRef.current);
+      const getState = () => (isEntry ? entryCameraState : exitCameraState);
+      const getDetector = () =>
+        isEntry ? entryFaceDetectorRef.current : exitFaceDetectorRef.current;
+
+      if (!getVideo() || !getDetector()) return;
+
+      const detect = (timestamp) => {
+        const currentVideo = getVideo();
+        const currentState = getState();
+        const detector = getDetector();
+
+        if (!currentVideo || currentState !== "active" || !detector) {
+          detectionFrameRef.current[cameraRole] = null;
+          return;
+        }
+
+        const lastDetection = detectionTimingRef.current[cameraRole];
+        if (timestamp - lastDetection < FACE_DETECTION_INTERVAL_MS) {
+          detectionFrameRef.current[cameraRole] = requestAnimationFrame(detect);
+          return;
+        }
+
+        detectionTimingRef.current[cameraRole] = timestamp;
+
+        if (
+          currentVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+          currentVideo.videoWidth > 0 &&
+          currentVideo.videoHeight > 0
+        ) {
+          try {
+            // requestAnimationFrame timestamps are monotonic. Each camera has
+            // its own detector, so timestamps cannot conflict between streams.
+            const result = detector.detectForVideo(currentVideo, timestamp);
+            const hasFace = (result.detections || []).length > 0;
+
+            consecutiveFacesRef.current[cameraRole] = hasFace
+              ? consecutiveFacesRef.current[cameraRole] + 1
+              : 0;
+
+            if (hasFace && consecutiveFacesRef.current[cameraRole] >= FACE_CONFIRMATION_FRAMES) {
+              const nowMs = Date.now();
+              const cooldownPassed =
+                nowMs - lastCaptureTimeRef.current[cameraRole] >= CAPTURE_COOLDOWN_MS;
+
+              if (!processingRef.current[cameraRole] && cooldownPassed) {
+                // Reserve the cooldown BEFORE starting the request so a second
+                // animation frame cannot trigger another request.
+                lastCaptureTimeRef.current[cameraRole] = nowMs;
+                processingRef.current[cameraRole] = true;
+                consecutiveFacesRef.current[cameraRole] = 0;
+
+                setCaptureMessage(
+                  `${isEntry ? "Entry" : "Exit"} camera detected a face — capturing automatically...`
+                );
+
+                const capturePromise = captureFrameRef.current?.(cameraRole);
+
+                Promise.resolve(capturePromise)
+                  .catch((error) => {
+                    console.error(`${cameraRole} automatic capture error:`, error);
+                  })
+                  .finally(() => {
+                    processingRef.current[cameraRole] = false;
+                  });
+              }
+            }
+          } catch (error) {
+            console.error(`${cameraRole} face detection error:`, error);
+          }
+        }
+
+        detectionFrameRef.current[cameraRole] = requestAnimationFrame(detect);
+      };
+
+      detectionFrameRef.current[cameraRole] = requestAnimationFrame(detect);
+    };
+
+    if (entryCameraState === "active") startDetection("entry");
+    if (exitCameraState === "active") startDetection("exit");
+
+    return () => {
+      if (detectionFrameRef.current.entry !== null) {
+        cancelAnimationFrame(detectionFrameRef.current.entry);
+        detectionFrameRef.current.entry = null;
+      }
+
+      if (detectionFrameRef.current.exit !== null) {
+        cancelAnimationFrame(detectionFrameRef.current.exit);
+        detectionFrameRef.current.exit = null;
+      }
+
+      consecutiveFacesRef.current = { entry: 0, exit: 0 };
+    };
+  }, [faceDetectorReady, entryCameraState, exitCameraState]);
+
+  useEffect(() => {
+    startTwoCameras();
+
+    return () => {
+      if (detectionFrameRef.current.entry !== null) {
+        cancelAnimationFrame(detectionFrameRef.current.entry);
+      }
+      if (detectionFrameRef.current.exit !== null) {
+        cancelAnimationFrame(detectionFrameRef.current.exit);
+      }
+      stopStream(entryStreamRef, entryVideoRef);
+      stopStream(exitStreamRef, exitVideoRef);
+    };
+    // Cameras are intentionally requested once when this section mounts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const cameraStatusText = (state) => {
+    if (state === "active") return "Camera Active";
+    if (state === "requesting") return "Requesting...";
+    if (state === "error") return "Camera Error";
+    return "Camera Off";
+  };
+
+  const renderCamera = ({
+    title,
+    number,
+    role,
+    roleLabel,
+    cameraKey,
+    videoRef,
+    state,
+    colorClass,
+  }) => (
+    <div className="sa-dual-camera-panel">
+      <div className="sa-dual-camera-head">
+        <div className="sa-dual-camera-title">
+          <div className={`sa-dual-camera-icon ${colorClass}`}>{role}</div>
+          <div>
+            <h3>{title}</h3>
+            <p>Camera {number} • {roleLabel}</p>
+          </div>
+        </div>
+
+        <span className={`sa-camera-status is-${state}`}>
+          {cameraStatusText(state)}
+        </span>
+      </div>
+
+      <div className="sa-dual-camera-frame">
+        {state !== "active" && (
+          <div className="sa-camera-placeholder">
+            <div className="sa-camera-placeholder-icon">
+              <Icon name="camera" size={38} />
+            </div>
+            <h3>{state === "requesting" ? "Connecting camera..." : "Camera unavailable"}</h3>
+            <p>
+              {state === "requesting"
+                ? "Please allow camera access."
+                : "Check the webcam connection and browser permission."}
+            </p>
+          </div>
+        )}
+
+        <video
+          ref={videoRef}
+          className={`sa-camera-video ${state === "active" ? "is-visible" : ""}`}
+          autoPlay
+          playsInline
+          muted
+        />
+
+        {state === "active" && (
+          <div className="sa-dual-camera-overlay">
+            <span>CAMERA {number}</span>
+            <strong>{roleLabel.toUpperCase()}</strong>
+          </div>
+        )}
+      </div>
+
+      <div className="sa-dual-camera-footer">
+        <span className="sa-dual-camera-connection">
+          <i className={state === "active" ? "is-online" : "is-offline"} />
+          {state === "active" ? "Live stream" : cameraStatusText(state)}
+        </span>
+
+        {state === "active" && (
+          <div className="sa-dual-camera-actions">
+            <button
+              type="button"
+              className="sa-mini-change-btn"
+              onClick={() => changeCamera(cameraKey)}
+              disabled={
+                verificationState === "checking" ||
+                changingCamera !== null ||
+                cameraDevices.length < 2
+              }
+              title={
+                cameraDevices.length < 2
+                  ? "Connect at least two cameras to change camera"
+                  : "Switch this camera to another connected webcam"
+              }
+            >
+              <span className="sa-change-camera-icon" aria-hidden="true">↻</span>
+              {changingCamera === cameraKey ? "Changing..." : "Change Camera"}
+            </button>
+
+            <span className="sa-auto-detect-status" title="Face detection is handled in the browser; identity verification is sent to Django.">
+              <i className="sa-auto-detect-dot" />
+              {faceDetectorReady ? "Auto detection ON" : "Loading detector..."}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <section
@@ -752,60 +1241,57 @@ function CameraAttendanceCard({
       <div className="sa-today-page-head">
         <div>
           <h2 id="today-attendance-title">Today Attendance</h2>
-          <p>Capture and verify student faces to mark attendance</p>
+          <p>Monitor entry and exit cameras and verify student faces</p>
         </div>
 
         <strong className="sa-today-date-head">{todayLabel}</strong>
       </div>
 
-      <div className="sa-today-workspace">
-        {/* LEFT: CAMERA */}
+      <div className="sa-today-workspace sa-two-camera-workspace">
+        {/* LEFT: TWO CAMERAS */}
         <div className="sa-today-left">
-          <section className="sa-camera-card">
+          <section className="sa-camera-card sa-dual-camera-card">
             <div className="sa-camera-card-head">
               <div className="sa-camera-title">
                 <Icon name="camera" size={22} />
-                <h3>Live Camera</h3>
+                <h3>Live Camera Monitoring</h3>
               </div>
 
-              <span className={`sa-camera-status is-${cameraState}`}>
-                {cameraState === "active"
-                  ? "Camera Active"
-                  : cameraState === "requesting"
-                    ? "Requesting..."
-                    : cameraState === "error"
-                      ? "Camera Error"
-                      : "Camera Off"}
+              <span
+                className={`sa-camera-status ${
+                  entryCameraState === "active" && exitCameraState === "active"
+                    ? "is-active"
+                    : "is-error"
+                }`}
+              >
+                {entryCameraState === "active" && exitCameraState === "active"
+                  ? "2 Cameras Active"
+                  : "Check Cameras"}
               </span>
             </div>
 
-            <div className="sa-camera-frame sa-camera-frame-large">
-              {cameraState !== "active" && (
-                <div className="sa-camera-placeholder">
-                  <div className="sa-camera-placeholder-icon">
-                    <Icon name="camera" size={42} />
-                  </div>
-                  <h3>Camera access required</h3>
-                  <p>Allow camera access to display the live camera.</p>
-                </div>
-              )}
+            <div className="sa-dual-camera-grid">
+              {renderCamera({
+                title: "Entry Camera",
+                number: "01",
+                role: "IN",
+                roleLabel: "Entrance",
+                cameraKey: "entry",
+                videoRef: entryVideoRef,
+                state: entryCameraState,
+                colorClass: "is-entry",
+              })}
 
-              <video
-                ref={videoRef}
-                className={`sa-camera-video ${cameraState === "active" ? "is-visible" : ""}`}
-                autoPlay
-                playsInline
-                muted
-              />
-
-              {cameraState === "active" && (
-                <div className="sa-camera-frame-guide" aria-hidden="true">
-                  <span className="corner top-left" />
-                  <span className="corner top-right" />
-                  <span className="corner bottom-left" />
-                  <span className="corner bottom-right" />
-                </div>
-              )}
+              {renderCamera({
+                title: "Exit Camera",
+                number: "02",
+                role: "OUT",
+                roleLabel: "Exit",
+                cameraKey: "exit",
+                videoRef: exitVideoRef,
+                state: exitCameraState,
+                colorClass: "is-exit",
+              })}
             </div>
 
             {cameraError && (
@@ -815,31 +1301,24 @@ function CameraAttendanceCard({
             )}
 
             <div className="sa-camera-actions sa-camera-actions-two">
-              {cameraState === "active" ? (
-                <button type="button" className="sa-camera-btn is-stop" onClick={stopCamera}>
-                  <span className="sa-stop-icon" />
-                  Stop Camera
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="sa-camera-btn is-start"
-                  onClick={startCamera}
-                  disabled={cameraState === "requesting"}
-                >
-                  <Icon name="camera" size={18} />
-                  {cameraState === "requesting" ? "Requesting Camera..." : "Start Camera"}
-                </button>
-              )}
+              <button
+                type="button"
+                className="sa-camera-btn is-start"
+                onClick={startTwoCameras}
+                disabled={entryCameraState === "requesting" || exitCameraState === "requesting"}
+              >
+                <Icon name="camera" size={18} />
+                Restart Cameras
+              </button>
 
               <button
                 type="button"
-                className="sa-camera-btn is-capture"
-                onClick={captureFrame}
-                disabled={cameraState !== "active" || verificationState === "checking"}
+                className="sa-camera-btn is-stop"
+                onClick={stopAllCameras}
+                disabled={entryCameraState === "idle" && exitCameraState === "idle"}
               >
-                <Icon name="camera" size={18} />
-                {verificationState === "checking" ? "Verifying..." : "Capture"}
+                <span className="sa-stop-icon" />
+                Stop Cameras
               </button>
             </div>
 
@@ -852,7 +1331,7 @@ function CameraAttendanceCard({
                     : "i"}
               </span>
               <p>
-                {captureMessage || "Camera is active. Click \"Capture\" to verify and mark attendance."}
+                {captureMessage || "Both cameras are monitored independently. A face is detected automatically and sent to Django for verification."}
               </p>
             </div>
 
@@ -982,9 +1461,7 @@ function CameraAttendanceCard({
                     }
                   >
                     <td>{index + 1}</td>
-                    <td>
-                      <Avatar student={student} />
-                    </td>
+                    <td><Avatar student={student} /></td>
                     <td className="sa-roster-name">{student.name}</td>
                     <td>{student.registerNo}</td>
                     <td>
@@ -1018,6 +1495,7 @@ function CameraAttendanceCard({
     </section>
   );
 }
+
 /**
  * Mock day status. Replace with a lookup built from your attendance API,
  * e.g. { "2026-09-04": "absent", "2026-09-07": "present", ... }
@@ -1458,3 +1936,5 @@ export default function StudentAttendanceDashboard({
     </div>
   );
 }
+
+

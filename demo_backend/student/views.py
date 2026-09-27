@@ -34,6 +34,7 @@ class stu_attendance_detials(viewsets.ModelViewSet):
     #     "period":["exact"],
     #     "timing":["exact"]
     # }
+    
 class VerifyStudentFace(APIView):
 
     def post(self, request):
